@@ -173,7 +173,6 @@ typedef enum {
 #include "api/plugin_support.h"
 
 typedef struct {
-  uint32_t disp_thread_data_off;
 #ifdef PLUGINS_NEW
   int free_plugin;
   mambo_plugin plugins[MAX_PLUGIN_NO];
@@ -184,6 +183,7 @@ void dbm_exit(dbm_thread *thread_data, uint32_t code);
 
 extern void dispatcher_trampoline();
 extern void syscall_wrapper();
+extern void* start_of_dispatcher_s;
 extern void* end_of_dispatcher_s;
 extern void th_to_arm();
 extern void th_enter(void *stack);
