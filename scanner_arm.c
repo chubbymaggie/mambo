@@ -17,6 +17,8 @@
   limitations under the License.
 */
 
+#ifdef __arm__
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -119,10 +121,6 @@ void arm_branch_save_context(dbm_thread *thread_data, uint32_t **o_write_p) {
 
   *o_write_p = write_p;
 }
-
-#define SETUP (1 << 0)
-#define REPLACE_TARGET (1 << 1)
-#define INSERT_BRANCH (1 << 2)
 
 void arm_branch_jump(dbm_thread *thread_data, uint32_t **o_write_p, int basic_block,
                      uint32_t offset, uint32_t *read_address, uint32_t cond, uint32_t flags) {
@@ -1896,3 +1894,4 @@ void arm_encode_stub_bb(dbm_thread *thread_data, int basic_block, uint32_t targe
   arm_branch_jump(thread_data, &write_p, basic_block, 0, (uint32_t *)(target - 8), AL, SETUP|REPLACE_TARGET|INSERT_BRANCH);
 }
 
+#endif // __arm__

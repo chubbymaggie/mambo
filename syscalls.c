@@ -36,6 +36,12 @@
   #define debug(...)
 #endif
 
+#ifdef __aarch64__
+  #define SIG_FRAG_OFFSET 4
+#else
+  #define SIG_FRAG_OFFSET 0
+#endif
+
 void *dbm_start_thread_pth(void *ptr) {
   dbm_thread *thread_data = (dbm_thread *)ptr;
   assert(thread_data->clone_args->child_stack);
@@ -56,17 +62,27 @@ void *dbm_start_thread_pth(void *ptr) {
   thread_data->tls = thread_data->clone_args->tls;
 
   // Copy the parent's saved register values to the child's stack
-  uintptr_t *child_stack = thread_data->clone_args->child_stack;
+#ifdef __arm__
+  uint32_t *child_stack = thread_data->clone_args->child_stack;
   child_stack -= 15; // reserve 15 words on the child's stack
-  mambo_memcpy(child_stack, thread_data->clone_args, sizeof(uintptr_t) * 14);
+  mambo_memcpy(child_stack, thread_data->clone_args, sizeof(uint32_t) * 14);
   child_stack[r0] = 0; // return 0
-  child_stack[14] = addr; // pc
+#endif
+#ifdef __aarch64__
+  uint64_t *child_stack = thread_data->clone_args->child_stack;
+  child_stack -= 34;
+  mambo_memcpy(child_stack, (void *)thread_data->clone_args, sizeof(uint64_t) * 32);
+  // move the values for X0 and X1 to the bottom of the stack
+  child_stack[32] = 0; // X0
+  child_stack[33] = child_stack[1]; // X1
+  child_stack += 2;
+#endif
 
   // Release the lock
-  __asm__ volatile("dmb");
+  __asm__ volatile("dmb sy");
   thread_data->tid = tid;
 
-  th_enter(child_stack);
+  th_enter(child_stack, addr);
   return NULL;
 }
 
@@ -124,6 +140,12 @@ int syscall_handler_pre(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_in
     case __NR_clone:
       clone_args = (sys_clone_args *)args;
 
+      if (clone_args->flags & CLONE_VFORK) {
+        assert(clone_args->child_stack == &args[32]
+               || clone_args->child_stack == NULL);
+        clone_args->child_stack = args;
+        clone_args->flags &= ~CLONE_VM;
+      }
       if (clone_args->flags & CLONE_VM) {
         if (!(clone_args->flags & CLONE_SETTLS)) {
           clone_args->tls = thread_data->tls;
@@ -167,7 +189,8 @@ int syscall_handler_pre(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_in
       if (sig_action
           && sig_action->sa_handler != SIG_IGN
           && sig_action->sa_handler != SIG_DFL) {
-        sig_action->sa_handler = (void *)lookup_or_scan(thread_data, (uintptr_t)sig_action->sa_handler, NULL);
+        sig_action->sa_handler = (void *)lookup_or_scan(thread_data, (uintptr_t)sig_action->sa_handler, NULL)
+                                 + SIG_FRAG_OFFSET;
       }
       break;
     case __NR_exit_group:
@@ -177,6 +200,32 @@ int syscall_handler_pre(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_in
       if (args[0] <= 2) { // stdin, stdout, stderr
         args[0] = 0;
         return 0;
+      }
+      break;
+    /* Remove the execute permission from application mappings. At this point, this mostly acts
+       as a safeguard in case a translation bug causes a branch to unmodified application code.
+       Page permissions happen to be passed in the third argument both for mmap and mprotect. */
+#ifdef __arm__
+    case __NR_mmap2:
+#endif
+    case __NR_mprotect:
+      /* Ensure that code pages are readable by the code scanner. */
+      if (args[2] & PROT_EXEC) {
+        assert(args[2] & PROT_READ);
+      }
+      args[2] &= ~PROT_EXEC;
+      break;
+
+    case __NR_munmap:
+      flush_code_cache(thread_data);
+      break;
+
+#ifdef __arm__
+    case __NR_vfork:
+      assert(thread_data->is_vfork_child == false);
+      thread_data->is_vfork_child = true;
+      for (int i = 0; i < 3; i++) {
+        thread_data->parent_scratch_regs[i] = thread_data->scratch_regs[i];
       }
       break;
     case __ARM_NR_cacheflush:
@@ -190,29 +239,7 @@ int syscall_handler_pre(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_in
       args[0] = 0;
       return 0;
       break;
-    /* Remove the execute permission from application mappings. At this point, this mostly acts
-       as a safeguard in case a translation bug causes a branch to unmodified application code.
-       Page permissions happen to be passed in the third argument both for mmap and mprotect. */
-    case __NR_mmap2:
-    case __NR_mprotect:
-      /* Ensure that code pages are readable by the code scanner. */
-      if (args[2] & PROT_EXEC) {
-        assert(args[2] & PROT_READ);
-      }
-      args[2] &= ~PROT_EXEC;
-      break;
-
-    case __NR_munmap:
-      flush_code_cache(thread_data);
-      break;
-
-    case __NR_vfork:
-      assert(thread_data->is_vfork_child == false);
-      thread_data->is_vfork_child = true;
-      for (int i = 0; i < 3; i++) {
-        thread_data->parent_scratch_regs[i] = thread_data->scratch_regs[i];
-      }
-      break;
+#endif
   }
   
   return 1;
@@ -234,6 +261,7 @@ void syscall_handler_post(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_
       }
       break;
 
+#ifdef __arm__
     case __NR_vfork:
       if (args[0] != 0) { // in the parent
         for (int i = 0; i < 3; i++) {
@@ -242,6 +270,7 @@ void syscall_handler_post(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_
         thread_data->is_vfork_child = false;
       }
       break;
+#endif
   }
 
 #ifdef PLUGINS_NEW

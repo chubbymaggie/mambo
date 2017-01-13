@@ -40,6 +40,10 @@
 #endif
 
 #ifdef DBM_TRACES
+  #ifdef __aarch64__
+    #error "There is no support for traces on AArch64 at the moment. Remove the -DDBM_TRACES CFLAG to build."
+  #endif
+
 uint32_t scan_trace(dbm_thread *thread_data, uint16_t *address, cc_type type) {
   uint8_t *write_p = thread_data->trace_cache_next;
   size_t  fragment_len;

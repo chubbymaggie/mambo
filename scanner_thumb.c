@@ -17,6 +17,8 @@
   limitations under the License.
 */
 
+#ifdef __arm__
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -3206,3 +3208,4 @@ void thumb_encode_stub_bb(dbm_thread *thread_data, int basic_block, uint32_t tar
   branch_jump(thread_data, &write_p, basic_block, target, SETUP|REPLACE_TARGET|INSERT_BRANCH);
 }
 
+#endif // __arm__
