@@ -42,37 +42,7 @@
  * For the 64-bit post-index and 64-bit pre-index variant: is the signed
  * immediate byte offset, a multiple of 8 in the range -512 to 504, encoded
  * in the "imm7" field as <imm>/8. Page 668.
- *
- * PUSH PAIR
- * STP Xt1, Xt2, [SP]!
- */
-#define a64_push_pair_reg(Xt1, Xt2) \
-  a64_LDP_STP(&write_p, 2, 0, 3, 0, -2, Xt2, sp, Xt1); \
-  write_p++;
-
-/*
- * POP PAIR
- * LDP Xt1, Xt2, [SP], #16
- */
-#define a64_pop_pair_reg(Xt1, Xt2) \
-  a64_LDP_STP(&write_p, 2, 0, 1, 1, 2, Xt2, sp, Xt1); \
-  write_p++;
-
-/*
- * PUSH REGISTER
- * STR reg, [SP, #-16]!
- */
-#define a64_push_reg(reg) \
-  a64_LDR_STR_immed(&write_p, 3, 0, 0, -16, 3, sp, reg); \
-  write_p++;
-
-/*
- * POP REGISTER
- * LDR reg, [SP], #16
- */
-#define a64_pop_reg(reg) \
-  a64_LDR_STR_immed(&write_p, 3, 0, 1, 16, 1, sp, reg); \
-  write_p++;
+*/
 
 #define a64_copy() *(write_p++) = *read_address;
 

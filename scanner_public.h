@@ -161,6 +161,38 @@ extern enum arm_cond_codes arm_inverse_cond_code[];
   } \
   write_p++;
 
+/*
+ * PUSH PAIR
+ * STP Xt1, Xt2, [SP]!
+ */
+#define a64_push_pair_reg(Xt1, Xt2) \
+  a64_LDP_STP(&write_p, 2, 0, 3, 0, -2, Xt2, sp, Xt1); \
+  write_p++;
+
+/*
+ * POP PAIR
+ * LDP Xt1, Xt2, [SP], #16
+ */
+#define a64_pop_pair_reg(Xt1, Xt2) \
+  a64_LDP_STP(&write_p, 2, 0, 1, 1, 2, Xt2, sp, Xt1); \
+  write_p++;
+
+/*
+ * PUSH REGISTER
+ * STR reg, [SP, #-16]!
+ */
+#define a64_push_reg(reg) \
+  a64_LDR_STR_immed(&write_p, 3, 0, 0, -16, 3, sp, reg); \
+  write_p++;
+
+/*
+ * POP REGISTER
+ * LDR reg, [SP], #16
+ */
+#define a64_pop_reg(reg) \
+  a64_LDR_STR_immed(&write_p, 3, 0, 1, 16, 1, sp, reg); \
+  write_p++;
+
 void copy_to_reg_16bit(uint16_t **write_p, enum reg reg, uint32_t value);
 void copy_to_reg_32bit(uint16_t **write_p, enum reg reg, uint32_t value);
 void a64_copy_to_reg_64bits(uint32_t **write_p, enum reg reg, uint64_t value);
