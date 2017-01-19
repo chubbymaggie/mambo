@@ -138,7 +138,7 @@ void a64_tbnz_helper(uint32_t *write_p, uint64_t target, enum reg reg, uint32_t 
 /*
  * Copy a value up to 64 bits to a register.
  */
-void a64_copy_to_regs_64bits(uint32_t **write_p, enum reg reg, uint64_t value)
+void a64_copy_to_reg_64bits(uint32_t **write_p, enum reg reg, uint64_t value)
 {
   uint32_t first_half_word = value & 0xFFFF;
   uint32_t second_half_word = (value >> 16) & 0xFFFF;
@@ -187,11 +187,11 @@ void a64_branch_jump(dbm_thread *thread_data, uint32_t **o_write_p,
   debug("A64 branch target: 0x%lx\n", target);
 
   if (flags & REPLACE_TARGET) {
-    a64_copy_to_regs_64bits(&write_p, x0, target);
+    a64_copy_to_reg_64bits(&write_p, x0, target);
   }
 
   if (flags & INSERT_BRANCH) {
-    a64_copy_to_regs_64bits(&write_p, x1, basic_block);
+    a64_copy_to_reg_64bits(&write_p, x1, basic_block);
     a64_B_BL(&write_p, 0, (thread_data->dispatcher_addr - (uint64_t)write_p ) >> 2);
     write_p++;
   }
@@ -228,17 +228,17 @@ void a64_branch_jump_cond(dbm_thread *thread_data, uint32_t **o_write_p, int bas
   write_p++;
 
   a64_branch_save_context(&write_p);
-  a64_copy_to_regs_64bits(&write_p, x1, basic_block);
+  a64_copy_to_reg_64bits(&write_p, x1, basic_block);
 
   cond_branch = write_p++;
 
-  a64_copy_to_regs_64bits(&write_p, x0, target);
+  a64_copy_to_reg_64bits(&write_p, x0, target);
   a64_b_helper(write_p, thread_data->dispatcher_addr);
   write_p++;
 
   a64_b_cond_helper(cond_branch, (uint64_t)write_p, invert_cond(cond));
 
-  a64_copy_to_regs_64bits(&write_p, x0, (uint64_t)read_address + 4);
+  a64_copy_to_reg_64bits(&write_p, x0, (uint64_t)read_address + 4);
   a64_b_helper(write_p, thread_data->dispatcher_addr);
   write_p++;
 
@@ -425,7 +425,7 @@ size_t scan_a64(dbm_thread *thread_data, uint32_t *read_address,
 
       case A64_SVC:
         a64_push_pair_reg(x29, x30);
-        a64_copy_to_regs_64bits(&write_p, x29, (uint64_t)read_address + 4);
+        a64_copy_to_reg_64bits(&write_p, x29, (uint64_t)read_address + 4);
         a64_B_BL(&write_p, 1,
                  ((uint64_t)thread_data->syscall_wrapper_addr - (uint64_t)write_p) >> 2);
         write_p++;
@@ -468,7 +468,7 @@ size_t scan_a64(dbm_thread *thread_data, uint32_t *read_address,
           }
 
           a64_push_reg(spilled_reg);
-          a64_copy_to_regs_64bits(&write_p, spilled_reg, (uint64_t)&thread_data->tls);
+          a64_copy_to_reg_64bits(&write_p, spilled_reg, (uint64_t)&thread_data->tls);
 
           if (R == 0) { // MSR
             a64_LDR_STR_immed(&write_p, 3, 0, 0, 0, 0, spilled_reg, Rt);
@@ -494,7 +494,7 @@ size_t scan_a64(dbm_thread *thread_data, uint32_t *read_address,
         a64_B_BL_decode_fields(read_address, &op, &imm26);
 
         if (op == 1) { // Branch Link
-          a64_copy_to_regs_64bits(&write_p, lr, (uint64_t)read_address + 4);
+          a64_copy_to_reg_64bits(&write_p, lr, (uint64_t)read_address + 4);
         }
 
         branch_offset = sign_extend64(26, imm26) << 2;
@@ -521,7 +521,7 @@ size_t scan_a64(dbm_thread *thread_data, uint32_t *read_address,
           case A64_BLR:
             a64_BLR_decode_fields(read_address, &Rn);
             if (Rn != lr) {
-              a64_copy_to_regs_64bits(&write_p, lr, (uint64_t)read_address + 4);
+              a64_copy_to_reg_64bits(&write_p, lr, (uint64_t)read_address + 4);
             }
             break;
           case A64_BR:
@@ -579,7 +579,7 @@ size_t scan_a64(dbm_thread *thread_data, uint32_t *read_address,
               write_p++;
             }
 
-            a64_copy_to_regs_64bits(&write_p, x0,
+            a64_copy_to_reg_64bits(&write_p, x0,
                                     (uint64_t)&thread_data->entry_address.entries);
 
             a64_logical_immed(&write_p, 1, 0, 1, 0, 16, realRn, x1);
@@ -608,7 +608,7 @@ size_t scan_a64(dbm_thread *thread_data, uint32_t *read_address,
             }
 
             if (inst == A64_BLR && Rn == lr) {
-              a64_copy_to_regs_64bits(&write_p, lr, (uint64_t)read_address + 4);
+              a64_copy_to_reg_64bits(&write_p, lr, (uint64_t)read_address + 4);
             }
 
             a64_BR(&write_p, x0);
@@ -619,14 +619,14 @@ size_t scan_a64(dbm_thread *thread_data, uint32_t *read_address,
             a64_logical_reg(&write_p, 1, 1, 0, 0, realRn, 0, xzr, x0);
             write_p++;
 
-            a64_copy_to_regs_64bits(&write_p, x1, basic_block);
+            a64_copy_to_reg_64bits(&write_p, x1, basic_block);
 
             if ((Rn == x0) || (Rn == x1)) {
               a64_pop_reg(x2);
             }
 
             if (inst == A64_BLR && Rn == lr) {
-              a64_copy_to_regs_64bits(&write_p, lr, (uint64_t)read_address + 4);
+              a64_copy_to_reg_64bits(&write_p, lr, (uint64_t)read_address + 4);
             }
 
             a64_b_helper(write_p, (uint64_t)thread_data->dispatcher_addr);
@@ -662,23 +662,23 @@ size_t scan_a64(dbm_thread *thread_data, uint32_t *read_address,
         if (V== 0) {
           switch(opc) {
             case 0: // LDR literal 32-bit variant
-              a64_copy_to_regs_64bits(&write_p, Rt, PC_relative_address);
+              a64_copy_to_reg_64bits(&write_p, Rt, PC_relative_address);
               a64_LDR_STR_unsigned_immed(&write_p, 2, V, 1, 0, Rt, Rt);
               write_p++;
               break;
             case 1: // LDR literal 64-bit variant
-              a64_copy_to_regs_64bits(&write_p, Rt, PC_relative_address);
+              a64_copy_to_reg_64bits(&write_p, Rt, PC_relative_address);
               a64_LDR_STR_unsigned_immed(&write_p, 3, V, 1, 0, Rt, Rt);
               write_p++;
               break;
             case 2: // LDR Signed Word (literal)
-              a64_copy_to_regs_64bits(&write_p, Rt, PC_relative_address);
+              a64_copy_to_reg_64bits(&write_p, Rt, PC_relative_address);
               a64_LDR_STR_unsigned_immed(&write_p, 2, V, 2, 0, Rt, Rt);
               while(1);
               break;
             case 3: // PRFM Prefetch
               a64_push_reg(x0);
-              a64_copy_to_regs_64bits(&write_p, x0, PC_relative_address);
+              a64_copy_to_reg_64bits(&write_p, x0, PC_relative_address);
               a64_LDR_STR_unsigned_immed(&write_p, 3, V, 2, 0, x0, Rt);
               write_p++;
               a64_pop_reg(x0);
@@ -704,7 +704,7 @@ size_t scan_a64(dbm_thread *thread_data, uint32_t *read_address,
               while(1);
           }
           a64_push_reg(x0);
-          a64_copy_to_regs_64bits(&write_p, x0, PC_relative_address);
+          a64_copy_to_reg_64bits(&write_p, x0, PC_relative_address);
           a64_LDR_STR_unsigned_immed(&write_p, size, V, opc, 0, x0, Rt);
           write_p++;
           a64_pop_reg(x0);
@@ -729,7 +729,7 @@ size_t scan_a64(dbm_thread *thread_data, uint32_t *read_address,
         }
 
         PC_relative_address += imm;
-        a64_copy_to_regs_64bits(&write_p, Rd, PC_relative_address);
+        a64_copy_to_reg_64bits(&write_p, Rd, PC_relative_address);
         break;
 
       case A64_BRK:
