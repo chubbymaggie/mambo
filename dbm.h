@@ -182,7 +182,8 @@ typedef struct {
 
 typedef enum {
   ARM_INST,
-  THUMB_INST
+  THUMB_INST,
+  A64_INST,
 } inst_set;
 
 #include "api/plugin_support.h"

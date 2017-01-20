@@ -319,6 +319,52 @@ void a64_check_free_space(dbm_thread *thread_data, uint32_t **write_p,
   }
 }
 
+bool a64_scanner_deliver_callbacks(dbm_thread *thread_data, mambo_cb_idx cb_id, uint32_t *read_address,
+                                   a64_instruction inst, uint32_t **o_write_p, uint32_t **o_data_p,
+                                   int basic_block, cc_type type, bool allow_write) {
+  bool replaced = false;
+#ifdef PLUGINS_NEW
+  if (global_data.free_plugin > 0) {
+    uint32_t *write_p = *o_write_p;
+    uint32_t *data_p = *o_data_p;
+
+    mambo_context ctx;
+    set_mambo_context(&ctx, thread_data, A64_INST, type, basic_block, inst, AL, read_address, write_p, NULL);
+
+    for (int i = 0; i < global_data.free_plugin; i++) {
+      if (global_data.plugins[i].cbs[cb_id] != NULL) {
+        ctx.write_p = write_p;
+        ctx.plugin_id = i;
+        ctx.replace = false;
+        global_data.plugins[i].cbs[cb_id](&ctx);
+        if (allow_write) {
+          if (replaced && (write_p != ctx.write_p || ctx.replace)) {
+            fprintf(stderr, "MAMBO API WARNING: plugin %d added code for overridden"
+                            "instruction (%p).\n", i, read_address);
+          }
+          if (ctx.replace) {
+            if (cb_id == PRE_INST_C) {
+              replaced = true;
+            } else {
+              fprintf(stderr, "MAMBO API WARNING: plugin %d set replace_inst for "
+                              "a disallowed event (at %p).\n", i, read_address);
+            }
+          }
+          write_p = ctx.write_p;
+          a64_check_free_space(thread_data, &write_p, &data_p, MIN_FSPACE);
+        } else {
+          assert(ctx.write_p == write_p);
+        }
+      }
+    }
+
+    *o_write_p = write_p;
+    *o_data_p = data_p;
+  }
+#endif
+  return replaced;
+}
+
 size_t scan_a64(dbm_thread *thread_data, uint32_t *read_address,
                 int basic_block, cc_type type, uint32_t *write_p) {
   bool stop = false;
@@ -367,6 +413,12 @@ size_t scan_a64(dbm_thread *thread_data, uint32_t *read_address,
     a64_instruction inst = a64_decode(read_address);
     debug("  instruction enum: %d\n", (inst == A64_INVALID) ? -1 : inst);
     debug("  instruction word: 0x%x\n", *read_address);
+
+#ifdef PLUGINS_NEW
+    bool skip_inst = a64_scanner_deliver_callbacks(thread_data, PRE_INST_C, read_address, inst,
+                                                   &write_p, &data_p, basic_block, type, true);
+    if (!skip_inst) {
+#endif
 
     switch (inst){
       case A64_CBZ_CBNZ:
@@ -784,6 +836,9 @@ size_t scan_a64(dbm_thread *thread_data, uint32_t *read_address,
         while(1);
         exit(EXIT_FAILURE);
     }
+#ifdef PLUGINS_NEW
+    } // if (!skip_inst)
+#endif
 
     if (data_p <= write_p) {
       fprintf(stderr, "%d, inst: %p, :write: %p\n", inst, data_p, write_p);
@@ -793,6 +848,9 @@ size_t scan_a64(dbm_thread *thread_data, uint32_t *read_address,
     if (!stop) {
       a64_check_free_space(thread_data, &write_p, &data_p, MIN_FSPACE);
     }
+#ifdef PLUGINS_NEW
+    a64_scanner_deliver_callbacks(thread_data, POST_INST_C, read_address, inst, &write_p, &data_p, basic_block, type, !stop);
+#endif
 
     read_address++;
   } // while(!stop)
