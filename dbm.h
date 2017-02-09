@@ -189,6 +189,8 @@ typedef enum {
 #include "api/plugin_support.h"
 
 typedef struct {
+  int argc;
+  char **argv;
 #ifdef PLUGINS_NEW
   int free_plugin;
   mambo_plugin plugins[MAX_PLUGIN_NO];
@@ -235,6 +237,9 @@ void mambo_deliver_callbacks(unsigned cb_id, dbm_thread *thread_data, inst_set i
                              cc_type fragment_type, int fragment_id, int inst, mambo_cond cond,
                              void *read_address, void *write_p, unsigned long *regs);
 #endif
+
+#define min(a, b) (((a) < (b)) ? (a) : (b))
+#define max(a, b) (((a) > (b)) ? (a) : (b))
 
 /* Constants */
 
