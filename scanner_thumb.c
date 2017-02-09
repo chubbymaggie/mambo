@@ -123,6 +123,7 @@ typedef struct {
   uint32_t it_cond;
   uint32_t it_mask;
   uint32_t it_initial_mask;
+  bool is_overwritten;
 } thumb_it_state;
 
 int it_get_no_of_inst(uint32_t mask) {
@@ -180,13 +181,14 @@ void it_clip_from_offset(uint16_t *write_p, uint32_t *cond, uint32_t *mask, int 
 }
 
 bool create_it_gap(uint16_t **write_p, thumb_it_state *it_state) {
-  if (it_state->cond_inst_after_it > 0) {
+  if (it_state->cond_inst_after_it > 0 && it_state->is_overwritten == false) {
     if ((it_get_no_of_inst(it_state->it_initial_mask) - it_state->cond_inst_after_it) > 0) {
       it_clip_len(it_state->it_inst_addr, it_state->it_cond, it_state->it_initial_mask,
                   it_get_no_of_inst(it_state->it_initial_mask) - it_state->cond_inst_after_it);
     } else {
       assert(it_state->it_inst_addr == *write_p - 1);
       *write_p = it_state->it_inst_addr;
+      it_state->is_overwritten = true;
     }
     return true;
   }
@@ -198,6 +200,7 @@ bool close_it_gap(uint16_t **write_p, thumb_it_state *it_state) {
     it_clip_from_offset(*write_p, &it_state->it_cond, &it_state->it_initial_mask,
                         it_get_no_of_inst(it_state->it_initial_mask) - it_state->cond_inst_after_it);
     it_state->it_inst_addr = *write_p;
+    it_state->is_overwritten = false;
     *write_p += 1;
     return true;
   }
@@ -205,7 +208,8 @@ bool close_it_gap(uint16_t **write_p, thumb_it_state *it_state) {
 }
 
 void thumb_check_free_space(dbm_thread *thread_data, uint16_t **o_write_p, uint32_t **o_data_p,
-                            thumb_it_state *it_state, uint32_t *addr_prev_block, size_t size) {
+                            thumb_it_state *it_state, uint32_t *addr_prev_block, bool handle_it,
+                            size_t size) {
   uint16_t *write_p = *o_write_p;
   uint32_t *data_p = *o_data_p;
 
@@ -217,14 +221,14 @@ void thumb_check_free_space(dbm_thread *thread_data, uint16_t **o_write_p, uint3
     int new_block = allocate_bb(thread_data);
 
     if ((uint32_t *)&thread_data->code_cache->blocks[new_block] != data_p) {
-      if (it_state->cond_inst_after_it > 0) {
+      if (handle_it && it_state->cond_inst_after_it > 0) {
         create_it_gap(&write_p, it_state);
       }
 
       thumb_b32_helper(write_p, (uint32_t)&thread_data->code_cache->blocks[new_block]);
       write_p = (uint16_t *)&thread_data->code_cache->blocks[new_block];
 
-      if (it_state->cond_inst_after_it > 0) {
+      if (handle_it && it_state->cond_inst_after_it > 0) {
         close_it_gap(&write_p, it_state);
       }
     }
@@ -956,7 +960,6 @@ bool thumb_scanner_deliver_callbacks(dbm_thread *thread_data, mambo_cb_idx cb_id
   if (global_data.free_plugin > 0) {
     uint16_t *write_p = *o_write_p;
     uint32_t *data_p = *o_data_p;
-    bool it_overw = false;
 
     mambo_cond cond;
     if (state->cond_inst_after_it > 0) {
@@ -970,7 +973,7 @@ bool thumb_scanner_deliver_callbacks(dbm_thread *thread_data, mambo_cb_idx cb_id
     if (allow_write && state->cond_inst_after_it > 0) {
       if (state->it_inst_addr == (write_p -1)) {
         write_p--;
-        it_overw = true;
+        state->is_overwritten = true;
       }
     }
 
@@ -998,7 +1001,7 @@ bool thumb_scanner_deliver_callbacks(dbm_thread *thread_data, mambo_cb_idx cb_id
             }
           }
 
-          thumb_check_free_space(thread_data, (uint16_t **)&ctx.write_p, &data_p, state, set_addr_prev_block, 82);
+          thumb_check_free_space(thread_data, (uint16_t **)&ctx.write_p, &data_p, state, set_addr_prev_block, false, 82);
         } else {
           assert(ctx.write_p == write_p);
         }
@@ -1008,10 +1011,8 @@ bool thumb_scanner_deliver_callbacks(dbm_thread *thread_data, mambo_cb_idx cb_id
     if (allow_write && state->cond_inst_after_it > 0) {
       if (ctx.write_p != write_p) {
         // Code was inserted.
-        if (!it_overw) {
-          // Reduce the length of the IT block
-          create_it_gap((uint16_t **)&ctx.write_p, state);
-        }
+        // Reduce the length of the IT block
+        create_it_gap((uint16_t **)&ctx.write_p, state);
         if (replaced) {
           // If the instruction was replaced by a plugin, remove its
           // condition from the head of the IT block
@@ -1021,8 +1022,9 @@ bool thumb_scanner_deliver_callbacks(dbm_thread *thread_data, mambo_cb_idx cb_id
         close_it_gap((uint16_t **)&ctx.write_p, state);
       } else {
         // If no code was inserted, keep the IT instruction
-        if (it_overw) {
+        if (state->is_overwritten) {
           ctx.write_p += 2;
+          state->is_overwritten = false;
         }
       }
     }
@@ -1141,6 +1143,7 @@ size_t scan_thumb(dbm_thread *thread_data, uint16_t *read_address, int basic_blo
   bool it_cond_handled = false;
   thumb_it_state it_state;
   it_state.cond_inst_after_it = 0;
+  it_state.is_overwritten = false;
 
   bool ldrex = false;
   bool insert_inline = false;
@@ -1382,7 +1385,7 @@ size_t scan_thumb(dbm_thread *thread_data, uint16_t *read_address, int basic_blo
             write_p = inst_pop_regs;
             data_p = inst_pop_regs_data;
             
-            thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, 8);
+            thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, true, 8);
             
             thumb_b16(&write_p, 3);
             write_p++;
@@ -1431,7 +1434,7 @@ size_t scan_thumb(dbm_thread *thread_data, uint16_t *read_address, int basic_blo
           if (inst_pop_regs) {
             write_p = inst_pop_regs;
             data_p = inst_pop_regs_data;
-            thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, 12);
+            thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, true, 12);
 
             /* If LR is in the list of POPed regs, it would be overwritten by POP
                after being set here. */
@@ -1479,7 +1482,7 @@ size_t scan_thumb(dbm_thread *thread_data, uint16_t *read_address, int basic_blo
           } else {
             reglist = 0;
           }
-          thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, 10);
+          thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, true, 10);
 
           get_n_regs(reglist, sr, 3);
           to_push = 0;
@@ -1517,7 +1520,7 @@ size_t scan_thumb(dbm_thread *thread_data, uint16_t *read_address, int basic_blo
             write_p++;
           }
 
-          thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, 122);
+          thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, true, 122);
 
           assert(rm != pc);
           thumb_mov32(&write_p, 0, sr[0], rm);
@@ -1675,7 +1678,7 @@ size_t scan_thumb(dbm_thread *thread_data, uint16_t *read_address, int basic_blo
         target = (uint32_t)read_address + branch_offset + 4 + 1;
         debug("Branch taken: 0x%x\n", target);
 
-        thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, CBZ_SIZE);
+        thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, true, CBZ_SIZE);
 
         // Mark this as the beggining of code emulating B
         thread_data->code_cache_meta[basic_block].exit_branch_type = cbz_thumb;
@@ -1763,7 +1766,7 @@ size_t scan_thumb(dbm_thread *thread_data, uint16_t *read_address, int basic_blo
               write_p++;
             }
 
-            thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, 110);
+            thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, true, 110);
 
             thumb_ldr_sp16(&write_p, sr[0], count_bits(reglist)-1);
             write_p++;
@@ -1844,7 +1847,7 @@ size_t scan_thumb(dbm_thread *thread_data, uint16_t *read_address, int basic_blo
         target = (uint32_t)read_address + 4 + 1 + branch_offset;
         debug("Branch taken: 0x%x\n", target);
 
-        thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, IMM_SIZE);
+        thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, true, IMM_SIZE);
 
         // Mark this as the beggining of code emulating B
         thread_data->code_cache_meta[basic_block].exit_branch_type = cond_imm_thumb;
@@ -2093,7 +2096,7 @@ size_t scan_thumb(dbm_thread *thread_data, uint16_t *read_address, int basic_blo
             assert(inst == THUMB_LDRI32);
 #ifdef DBM_D_INLINE_HASH
             // make sure there's no writeback
-            thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, 124);
+            thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, true, 124);
 
             sr[0] = r4;
             sr[1] = r5;
@@ -2570,7 +2573,7 @@ size_t scan_thumb(dbm_thread *thread_data, uint16_t *read_address, int basic_blo
           read_address = (uint16_t *)(target - 4 - 1);
         } else {
 #endif
-          thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, DISP_CALL_SIZE);
+          thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, true, DISP_CALL_SIZE);
 
           if (inst == THUMB_BL_ARM32) {
             thread_data->code_cache_meta[basic_block].exit_branch_type = uncond_blxi_thumb;
@@ -2612,7 +2615,7 @@ size_t scan_thumb(dbm_thread *thread_data, uint16_t *read_address, int basic_blo
         target = (uint32_t)read_address + branch_offset + 4 + 1;
         debug("Computed target: 0x%x\n", target);
 
-        thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, IMM_SIZE);
+        thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, true, IMM_SIZE);
 
         // Mark this as the beggining of code emulating B
         thread_data->code_cache_meta[basic_block].exit_branch_type = cond_imm_thumb;
@@ -2765,7 +2768,7 @@ size_t scan_thumb(dbm_thread *thread_data, uint16_t *read_address, int basic_blo
           assert(thread_data->free_block == basic_block+1);
           /*basic_block = */thread_data->free_block++;
           data_p += BASIC_BLOCK_SIZE;
-          thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, 472);
+          thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, true, 472);
   #else
           if (type == mambo_trace || type == mambo_trace_entry) {
   #endif
@@ -2859,7 +2862,7 @@ size_t scan_thumb(dbm_thread *thread_data, uint16_t *read_address, int basic_blo
           thumb_push16(&write_p, reglist);
           write_p++;
 
-          thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, 118);
+          thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, true, 118);
    
           if (rn == pc) {
             copy_to_reg_32bit(&write_p, sr[1], (uint32_t)read_address + 4);
@@ -2970,7 +2973,7 @@ size_t scan_thumb(dbm_thread *thread_data, uint16_t *read_address, int basic_blo
 
               reglist |= to_push;
             }
-            thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, 108);
+            thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, true, 108);
 
             thumb_ldr_sp16(&write_p, sr[0], count_bits(reglist)-1);
             write_p++;
@@ -3171,7 +3174,7 @@ size_t scan_thumb(dbm_thread *thread_data, uint16_t *read_address, int basic_blo
     }
     
     if (!stop) {
-      thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, 86);
+      thumb_check_free_space(thread_data, &write_p, &data_p, &it_state, &set_addr_prev_block, true, 86);
     }
     debug("\n");
 #ifdef PLUGINS_NEW
