@@ -619,10 +619,10 @@ size_t scan_a64(dbm_thread *thread_data, uint32_t *read_address,
             a64_copy_to_reg_64bits(&write_p, x0,
                                     (uint64_t)&thread_data->entry_address.entries);
 
-            a64_logical_immed(&write_p, 1, 0, 1, 0, 16, realRn, x1);
+            a64_logical_immed(&write_p, 1, 0, 1, 62, 16, realRn, x1);
             write_p++;
 
-            a64_ADD_SUB_shift_reg(&write_p, 1, 0, 0, 0, x1, 0x4, x0, x0);
+            a64_ADD_SUB_shift_reg(&write_p, 1, 0, 0, 0, x1, 0x2, x0, x0);
             write_p++;
 
             loop = write_p;
