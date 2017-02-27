@@ -771,6 +771,7 @@ size_t scan_a64(dbm_thread *thread_data, uint32_t *read_address,
 
       case A64_BRK:
       case A64_HINT:
+      case A64_CLREX:
       case A64_DSB:
       case A64_DMB:
       case A64_ISB:
