@@ -3,6 +3,7 @@
       https://github.com/beehive-lab/mambo
 
   Copyright 2013-2016 Cosmin Gorgovan <cosmin at linux-geek dot org>
+  Copyright 2017 The University of Manchester
 
   Licensed under the Apache License, Version 2.0 (the "License");
   you may not use this file except in compliance with the License.
@@ -21,9 +22,14 @@
 #define __DBM_H__
 
 #include <stdbool.h>
+#include <signal.h>
+#include <limits.h>
+#include <stdint.h>
 
+#ifdef __arm__
 #include "pie/pie-arm-decoder.h"
 #include "pie/pie-thumb-decoder.h"
+#endif
 
 #include "common.h"
 #include "util.h"
@@ -72,6 +78,9 @@ typedef enum {
 
 typedef enum {
   unknown,
+  stub,
+  trace_inline_max,
+#ifdef __arm__
   uncond_b_to_bl_thumb,
   uncond_imm_thumb,
   uncond_reg_thumb,
@@ -89,7 +98,6 @@ typedef enum {
   tbb,
   tbh,
   tb_indirect,
-  stub,
   pred_bxlr,
   pred_pop16pc,
   pred_ldmfd32pc,
@@ -97,7 +105,14 @@ typedef enum {
   pred_ldrpcsp,
   pred_armldmpc,
   pred_bad,
-  trace_inline_max,
+#endif //__arm__
+#ifdef __aarch64__
+  uncond_imm_a64,
+  uncond_branch_reg,
+  cond_imm_a64,
+  cbz_a64,
+  tbz_a64,
+#endif // __aarch64__
 } branch_type;
 
 typedef struct {
@@ -109,14 +124,25 @@ typedef struct {
   uint8_t  traces[TRACE_CACHE_SIZE];
 } dbm_code_cache;
 
+#define FALLTHROUGH_LINKED (1 << 0)
+#define BRANCH_LINKED (1 << 1)
+#define BOTH_LINKED (1 << 2)
+
 typedef struct {
   uint16_t *source_addr;
+  uintptr_t tpc;
   branch_type exit_branch_type;
+  int actual_id;
+#ifdef __arm__
   uint16_t *exit_branch_addr;
-  uint32_t branch_taken_addr;
-  uint32_t branch_skipped_addr;
-  uint32_t branch_condition;
-  uint32_t branch_cache_status;
+#endif // __arm__
+#ifdef __aarch64__
+  uint32_t *exit_branch_addr;
+#endif // __arch64__
+  uintptr_t branch_taken_addr;
+  uintptr_t branch_skipped_addr;
+  uintptr_t branch_condition;
+  uintptr_t branch_cache_status;
   uint32_t rn;
   uint32_t free_b;
   ll_entry *linked_from;
@@ -125,18 +151,42 @@ typedef struct {
 typedef struct {
   unsigned long flags;
   void *child_stack;
-  unsigned long *ptid;
-  unsigned long tls;
-  unsigned long *ctid;
+  pid_t *ptid;
+  uintptr_t tls;
+  pid_t *ctid;
 } sys_clone_args;
 
+struct trace_exits {
+  uintptr_t from;
+  uintptr_t to;
+};
+
+#define MAX_TRACE_REC_EXITS (MAX_TRACE_FRAGMENTS+1)
 typedef struct {
+  int id;
+  int source_bb;
+  void *write_p;
+  uintptr_t entry_addr;
+  bool active;
+  int free_exit_rec;
+  struct trace_exits exits[MAX_TRACE_REC_EXITS];
+} trace_in_prog;
+
+enum dbm_thread_status {
+  THREAD_RUNNING = 0,
+  THREAD_SYSCALL,
+  THREAD_EXIT
+};
+
+typedef struct dbm_thread_s dbm_thread;
+struct dbm_thread_s {
+  dbm_thread *next_thread;
+  enum dbm_thread_status status;
+
   int free_block;
-  uint32_t dispatcher_addr;
-  uint32_t syscall_wrapper_addr;
-  uint32_t scratch_regs[3];
-  uint32_t parent_scratch_regs[3];
-  bool is_vfork_child;
+  bool was_flushed;
+  uintptr_t dispatcher_addr;
+  uintptr_t syscall_wrapper_addr;
 
   dbm_code_cache *code_cache;
   dbm_code_cache_meta code_cache_meta[CODE_CACHE_SIZE + TRACE_FRAGMENT_NO];
@@ -145,71 +195,121 @@ typedef struct {
   hash_table trace_entry_address;
 
   uint8_t   exec_count[CODE_CACHE_SIZE];
-  uint32_t  trace_head_incr_addr;
+  uintptr_t trace_head_incr_addr;
   uint8_t  *trace_cache_next;
   int       trace_id;
   int       trace_fragment_count;
+  trace_in_prog active_trace;
 #endif
 
   ll *cc_links;
 
-  uint32_t tls;
-  uint32_t child_tls;
+  uintptr_t tls;
+  uintptr_t child_tls;
 
 #ifdef PLUGINS_NEW
   void *plugin_priv[MAX_PLUGIN_NO];
 #endif
   void *clone_ret_addr;
-  volatile int tid;
+  volatile pid_t tid;
   sys_clone_args *clone_args;
   bool clone_vm;
-} dbm_thread;
+  int pending_signals[_NSIG];
+  uint32_t is_signal_pending;
+};
 
 typedef enum {
   ARM_INST,
-  THUMB_INST
+  THUMB_INST,
+  A64_INST,
 } inst_set;
 
 #include "api/plugin_support.h"
 
 typedef struct {
-  uint32_t disp_thread_data_off;
   int argc;
   char **argv;
+  interval_map exec_allocs;
+  uintptr_t signal_handlers[_NSIG];
+  pthread_mutex_t signal_handlers_mutex;
+  uintptr_t brk;
+  uintptr_t initial_brk;
+  pthread_mutex_t brk_mutex;
+
+  dbm_thread *threads;
+  pthread_mutex_t thread_list_mutex;
+
+  volatile int exit_group;
 #ifdef PLUGINS_NEW
   int free_plugin;
   mambo_plugin plugins[MAX_PLUGIN_NO];
 #endif
 } dbm_global;
 
+typedef struct {
+  uintptr_t tpc;
+  uintptr_t spc;
+} cc_addr_pair;
+
 void dbm_exit(dbm_thread *thread_data, uint32_t code);
+void thread_abort(dbm_thread *thread_data);
 
 extern void dispatcher_trampoline();
 extern void syscall_wrapper();
+extern void trace_head_incr();
+extern void* start_of_dispatcher_s;
 extern void* end_of_dispatcher_s;
 extern void th_to_arm();
-extern void th_enter(void *stack);
+extern void th_enter(void *stack, uintptr_t cc_addr);
+extern void send_self_signal();
+extern void syscall_wrapper_svc();
 
+int lock_thread_list(void);
+int unlock_thread_list(void);
+int register_thread(dbm_thread *thread_data, bool caller_has_lock);
+int unregister_thread(dbm_thread *thread_data, bool caller_has_lock);
 bool allocate_thread_data(dbm_thread **thread_data);
+int free_thread_data(dbm_thread *thread_data);
 void init_thread(dbm_thread *thread_data);
-uint32_t lookup_or_scan(dbm_thread *thread_data, uint32_t target, bool *cached);
-uint32_t lookup_or_stub(dbm_thread *thread_data, uint32_t target);
-uint32_t scan(dbm_thread *thread_data, uint16_t *address, int basic_block);
+void reset_process(dbm_thread *thread_data);
+
+uintptr_t cc_lookup(dbm_thread *thread_data, uintptr_t target);
+uintptr_t lookup_or_scan(dbm_thread *thread_data, uintptr_t target, bool *cached);
+uintptr_t lookup_or_stub(dbm_thread *thread_data, uintptr_t target);
+uintptr_t scan(dbm_thread *thread_data, uint16_t *address, int basic_block);
 uint32_t scan_arm(dbm_thread *thread_data, uint32_t *read_address, int basic_block, cc_type type, uint32_t *write_p);
 uint32_t scan_thumb(dbm_thread *thread_data, uint16_t *read_address, int basic_block, cc_type type, uint16_t *write_p);
+size_t   scan_a64(dbm_thread *thread_data, uint32_t *read_address, int basic_block, cc_type type, uint32_t *write_p);
 int allocate_bb(dbm_thread *thread_data);
-void trace_dispatcher(uint32_t target, uint32_t *next_addr, uint32_t source_index, dbm_thread *thread_data);
+void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_index, dbm_thread *thread_data);
 void flush_code_cache(dbm_thread *thread_data);
+#ifdef __aarch64__
+void generate_trace_exit(dbm_thread *thread_data, uint32_t **o_write_p, int fragment_id, bool is_taken);
+#endif
+void insert_cond_exit_branch(dbm_code_cache_meta *bb_meta, void **o_write_p, int cond);
+void sigret_dispatcher_call(dbm_thread *thread_data, ucontext_t *cont, uintptr_t target);
 
 void thumb_encode_stub_bb(dbm_thread *thread_data, int basic_block, uint32_t target);
 void arm_encode_stub_bb(dbm_thread *thread_data, int basic_block, uint32_t target);
 
-int addr_to_bb_id(dbm_thread *thread_data, uint32_t addr);
-void record_cc_link(dbm_thread *thread_data, uint32_t linked_from, uint32_t linked_to_addr);
-bool is_bb(dbm_thread *thread_data, uint32_t addr);
+int addr_to_bb_id(dbm_thread *thread_data, uintptr_t addr);
+int addr_to_fragment_id(dbm_thread *thread_data, uintptr_t addr);
+void record_cc_link(dbm_thread *thread_data, uintptr_t linked_from, uintptr_t linked_to_addr);
+bool is_bb(dbm_thread *thread_data, uintptr_t addr);
+void install_system_sig_handlers();
+
+inline static uintptr_t adjust_cc_entry(uintptr_t addr) {
+#ifdef __arm__
+  if (addr != UINT_MAX) {
+    addr += 4 - ((addr & 1) << 1); // +4 for ARM, +2 for Thumb
+  }
+#endif
+  return addr;
+}
 
 extern dbm_global global_data;
 extern dbm_thread *disp_thread_data;
+extern uint32_t *th_is_pending_ptr;
 extern __thread dbm_thread *current_thread;
 
 #ifdef PLUGINS_NEW
@@ -225,13 +325,6 @@ void mambo_deliver_callbacks(unsigned cb_id, dbm_thread *thread_data, inst_set i
 #define max(a, b) (((a) > (b)) ? (a) : (b))
 
 /* Constants */
-
-#define SYSCALL_EXIT         1
-#define SYSCALL_CLOSE        6
-#define SYSCALL_CLONE        120
-#define SYSCALL_RT_SIGACTION 174
-#define SYSCALL_EXIT_GROUP   248
-#define SYSCALL_SET_TLS      0xF0005
 
 #define ALLOCATE_BB 0
 
@@ -252,10 +345,29 @@ void mambo_deliver_callbacks(unsigned cb_id, dbm_thread *thread_data, inst_set i
 #endif
 
 #define ROUND_UP(input, multiple_of) \
-  (((input / multiple_of) * multiple_of) + ((input % multiple_of) ? multiple_of : 0))
+  ((((input) / (multiple_of)) * (multiple_of)) + (((input) % (multiple_of)) ? (multiple_of) : 0))
 
 #define CC_SZ_ROUND(input) ROUND_UP(input, CC_PAGE_SIZE)
 #define METADATA_SZ_ROUND(input) ROUND_UP(input, CC_PAGE_SIZE)
+
+#define PAGE_SIZE 4096
+
+#define trampolines_size_bytes         ((uintptr_t)&end_of_dispatcher_s - (uintptr_t)&start_of_dispatcher_s)
+#define trampolines_size_bbs           ((trampolines_size_bytes / sizeof(dbm_block)) \
+                                      + ((trampolines_size_bytes % sizeof(dbm_block)) ? 1 : 0))
+
+#define UNLINK_SIGNAL (SIGILL)
+#define CPSR_T (0x20)
+
+#ifdef __arm__
+  #define context_pc uc_mcontext.arm_pc
+  #define context_sp uc_mcontext.arm_sp
+  #define context_reg(reg) uc_mcontext.arm_r##reg
+#elif __aarch64__
+  #define context_pc uc_mcontext.pc
+  #define context_sp uc_mcontext.sp
+  #define context_reg(reg) uc_mcontext.regs[reg]
+#endif
 
 #endif
 

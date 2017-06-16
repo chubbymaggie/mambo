@@ -2,7 +2,7 @@
   This file is part of MAMBO, a low-overhead dynamic binary modification tool:
       https://github.com/beehive-lab/mambo
 
-  Copyright 2013-2016 Cosmin Gorgovan <cosmin at linux-geek dot org>
+  Copyright 2017 The University of Manchester
 
   Licensed under the Apache License, Version 2.0 (the "License");
   you may not use this file except in compliance with the License.
@@ -17,13 +17,19 @@
   limitations under the License.
 */
 
-#include "dbm.h"
-#include "scanner_public.h"
+/* Defined as a multiple of <native register width> (i.e. 4 bytes on AArch32
+   and 8 bytes on AArch64), not bytes
+*/
 #ifdef __arm__
-  #include "api/emit_thumb.h"
-  #include "api/emit_arm.h"
+  /* SP decremented twice +
+     14 regs pushed by the SVC translation
+  */
+  #define SYSCALL_WRAPPER_STACK_OFFSET (2 + 14)
 #elif __aarch64__
-  #include "api/emit_a64.h"
+  /* 2  regs(x29, x30) pushed by the SVC translation
+     2  (TPC, SVC) +
+     22 (X0-X21) +
+     (32*2) NEON/FP registers saved in the wrapper
+  */
+  #define SYSCALL_WRAPPER_STACK_OFFSET (2 + 2 + 22 + 32*2)
 #endif
-#include "api/helpers.h"
-#include "scanner_common.h"

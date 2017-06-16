@@ -2,7 +2,8 @@
   This file is part of MAMBO, a low-overhead dynamic binary modification tool:
       https://github.com/beehive-lab/mambo
 
-  Copyright 2013-2017 Cosmin Gorgovan <cosmin at linux-geek dot org>
+  Copyright 2013-2016 Cosmin Gorgovan <cosmin at linux-geek dot org>
+  Copyright 2017 The University of Manchester
 
   Licensed under the Apache License, Version 2.0 (the "License");
   you may not use this file except in compliance with the License.
@@ -19,7 +20,6 @@
 
 #include <stdio.h>
 #include <asm/unistd.h>
-#include <signal.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -27,8 +27,12 @@
 #include <assert.h>
 #include <limits.h>
 #include <string.h>
+#include <errno.h>
 
 #include "dbm.h"
+#include "kernel_sigaction.h"
+#include "scanner_common.h"
+#include "syscalls.h"
 
 #ifdef DEBUG
   #define debug(...) fprintf(stderr, __VA_ARGS__)
@@ -36,14 +40,19 @@
   #define debug(...)
 #endif
 
+#ifdef __aarch64__
+  #define SIG_FRAG_OFFSET 4
+#else
+  #define SIG_FRAG_OFFSET 0
+#endif
+
 void *dbm_start_thread_pth(void *ptr) {
   dbm_thread *thread_data = (dbm_thread *)ptr;
   assert(thread_data->clone_args->child_stack);
 
   current_thread = thread_data;
-  uint32_t addr = scan(thread_data, thread_data->clone_ret_addr, ALLOCATE_BB);
-  uint32_t tid = syscall(__NR_gettid);
 
+  pid_t tid = syscall(__NR_gettid);
   if (thread_data->clone_args->flags & CLONE_PARENT_SETTID) {
     *thread_data->clone_args->ptid = tid;
   }
@@ -56,20 +65,31 @@ void *dbm_start_thread_pth(void *ptr) {
   thread_data->tls = thread_data->clone_args->tls;
 
   // Copy the parent's saved register values to the child's stack
+#ifdef __arm__
   uint32_t *child_stack = thread_data->clone_args->child_stack;
   child_stack -= 15; // reserve 15 words on the child's stack
-  mambo_memcpy(child_stack, thread_data->clone_args, sizeof(uint32_t) * 14);
+  mambo_memcpy(child_stack, thread_data->clone_args, sizeof(uintptr_t) * 14);
   child_stack[r0] = 0; // return 0
-  child_stack[r8] = thread_data->scratch_regs[0];
-  child_stack[r9] = thread_data->scratch_regs[1];
-  child_stack[13] = thread_data->scratch_regs[2]; // R14
-  child_stack[14] = addr; // pc
+#endif
+#ifdef __aarch64__
+  uint64_t *child_stack = thread_data->clone_args->child_stack;
+  child_stack -= 34;
+  mambo_memcpy(child_stack, (void *)thread_data->clone_args, sizeof(uintptr_t) * 32);
+  // move the values for X0 and X1 to the bottom of the stack
+  child_stack[32] = 0; // X0
+  child_stack[33] = child_stack[1]; // X1
+  child_stack += 2;
+#endif
 
   // Release the lock
-  __asm__ volatile("dmb");
+  __asm__ volatile("dmb sy");
   thread_data->tid = tid;
 
-  th_enter(child_stack);
+  assert(register_thread(thread_data, false) == 0);
+
+  uintptr_t addr = scan(thread_data, thread_data->clone_ret_addr, ALLOCATE_BB);
+  th_enter(child_stack, addr);
+
   return NULL;
 }
 
@@ -85,9 +105,6 @@ dbm_thread *dbm_create_thread(dbm_thread *thread_data, void *next_inst, sys_clon
   new_thread_data->clone_ret_addr = next_inst;
   new_thread_data->tid = 0;
   new_thread_data->clone_args = args;
-  for (int i = 0; i < 3; i++) {
-    new_thread_data->scratch_regs[i] = thread_data->scratch_regs[i];
-  }
 
   pthread_attr_t attr;
   pthread_attr_init(&attr);
@@ -103,10 +120,36 @@ dbm_thread *dbm_create_thread(dbm_thread *thread_data, void *next_inst, sys_clon
   return new_thread_data;
 }
 
+uintptr_t emulate_brk(uintptr_t addr) {
+  int ret;
 
-// return 0 to skip the syscall
-int syscall_handler_pre(uint32_t syscall_no, uint32_t *args, uint16_t *next_inst, dbm_thread *thread_data) {
-  struct sigaction *sig_action;
+  // Fast path
+  if (addr == 0 || addr == global_data.brk) {
+    return global_data.brk;
+  }
+
+  ret = pthread_mutex_lock(&global_data.brk_mutex);
+  assert(ret == 0);
+
+  /* We use mremap for non-overlapping re-allocation, therefore
+     we must always always keep at least one allocated page. */
+  if (addr >= (global_data.initial_brk + PAGE_SIZE)) {
+    void *map = mremap((void *)global_data.initial_brk,
+                       global_data.brk - global_data.initial_brk,
+                       addr - global_data.initial_brk, 0);
+    if (map != MAP_FAILED) {
+      global_data.brk = addr;
+    }
+  }
+
+  ret = pthread_mutex_unlock(&global_data.brk_mutex);
+  assert(ret == 0);
+
+  return global_data.brk;
+}
+
+int syscall_handler_pre(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_inst, dbm_thread *thread_data) {
+  int do_syscall = 1;
   sys_clone_args *clone_args;
   debug("syscall pre %d\n", syscall_no);
 
@@ -127,10 +170,15 @@ int syscall_handler_pre(uint32_t syscall_no, uint32_t *args, uint16_t *next_inst
 #endif
 
   switch(syscall_no) {
-    case SYSCALL_CLONE:
+    case __NR_brk:
+      args[0] = emulate_brk(args[0]);
+      do_syscall = 0;
+      break;
+    case __NR_clone:
       clone_args = (sys_clone_args *)args;
 
-      if (clone_args->flags & CLONE_VM) {
+      if (clone_args->flags & CLONE_THREAD) {
+        assert(clone_args->flags & CLONE_VM);
         if (!(clone_args->flags & CLONE_SETTLS)) {
           clone_args->tls = thread_data->tls;
         }
@@ -138,63 +186,92 @@ int syscall_handler_pre(uint32_t syscall_no, uint32_t *args, uint16_t *next_inst
 
         dbm_thread *child_data = dbm_create_thread(thread_data, next_inst, clone_args);
         while(child_data->tid == 0);
+        __asm__ volatile("dmb sy");
         args[0] = child_data->tid;
 
-        return 0;
-      } else {
-        thread_data->child_tls = (clone_args->flags & CLONE_SETTLS) ? clone_args->tls : thread_data->tls;
-        clone_args->flags &= ~CLONE_SETTLS;
+        do_syscall = 0;
+        break;
+      }
 
-        thread_data->clone_vm = false;
+      if (clone_args->flags & CLONE_VFORK) {
+        clone_args->flags &= ~CLONE_VM;
       }
+      assert((clone_args->flags & CLONE_VM) == 0);
+      thread_data->clone_vm = false;
+
+      thread_data->child_tls = (clone_args->flags & CLONE_SETTLS) ? clone_args->tls : thread_data->tls;
+      clone_args->flags &= ~CLONE_SETTLS;
+
+      if (clone_args->child_stack != NULL) {
+        if (clone_args->child_stack == &args[SYSCALL_WRAPPER_STACK_OFFSET]) {
+          clone_args->child_stack = args;
+        } else {
+          size_t copy_size = SYSCALL_WRAPPER_STACK_OFFSET * sizeof(uintptr_t);
+          clone_args->child_stack -= copy_size;
+          mambo_memcpy(clone_args->child_stack, args, copy_size);
+        }
+      } // if child_stack != NULL
       break;
-    case SYSCALL_EXIT:
+    case __NR_exit:
       debug("thread exit\n");
-#ifdef PLUGINS_NEW
-      mambo_deliver_callbacks(POST_THREAD_C, thread_data, -1, -1, -1, -1, -1, NULL, NULL, NULL);
-#endif
-      if (munmap(thread_data->code_cache, CC_SZ_ROUND(sizeof(dbm_code_cache))) != 0) {
-        fprintf(stderr, "Error freeing code cache on exit()\n");
-        while(1);
-      }
-      if (munmap(thread_data, METADATA_SZ_ROUND(sizeof(dbm_thread))) != 0) {
-        fprintf(stderr, "Error freeing thread private structure on exit()\n");
-        while(1);
-      }
+
+      assert(unregister_thread(thread_data, false) == 0);
+      assert(free_thread_data(thread_data) == 0);
+
       pthread_exit(NULL); // this should never return
       while(1); 
       break;
-    case SYSCALL_RT_SIGACTION:
-      debug("sigaction %d\n", args[0]);
-      debug("struct sigaction at 0x%x\n", args[1]);
-      sig_action = (struct sigaction *)args[1];
-      // If act is non-NULL, the new action for signal signum is installed from act. If oldact is non-NULL, the previous action is saved in oldact.
-      debug("handler at %p\n", sig_action->sa_handler);
-      if (sig_action
-          && sig_action->sa_handler != SIG_IGN
-          && sig_action->sa_handler != SIG_DFL) {
-        sig_action->sa_handler = (void *)lookup_or_scan(thread_data, (uint32_t)sig_action->sa_handler, NULL);
+#ifdef __arm__
+    case __NR_sigaction:
+      fprintf(stderr, "check sigaction()\n");
+      while(1);
+#endif
+    case __NR_rt_sigaction: {
+      uintptr_t handler = 0xdead;
+      assert(args[3] == 8 && args[0] >= 0 && args[0] < _NSIG);
+
+      struct kernel_sigaction *act = (struct kernel_sigaction *)args[1];
+      if (act != NULL) {
+        handler = (uintptr_t)act->k_sa_handler;
+        // Never remove the UNLINK_SIGNAL handler, which is used internally by MAMBO
+        if (args[0] == UNLINK_SIGNAL || (act->k_sa_handler != SIG_IGN && act->k_sa_handler != SIG_DFL)) {
+          act->k_sa_handler = (__sighandler_t)signal_trampoline;
+          act->sa_flags |= SA_SIGINFO;
+        }
       }
+
+      // A mutex is used to ensure that changes to the handler and all other options appear atomic
+      int ret = pthread_mutex_lock(&global_data.signal_handlers_mutex);
+      assert(ret == 0);
+
+      uintptr_t syscall_ret = raw_syscall(syscall_no, args[0], args[1], args[2], args[3]);
+      if (syscall_ret == 0) {
+        struct kernel_sigaction *oldact = (struct kernel_sigaction *)args[2];
+        if (oldact != NULL && oldact->k_sa_handler != SIG_IGN && oldact->k_sa_handler != SIG_DFL) {
+          oldact->k_sa_handler = (void *)global_data.signal_handlers[args[0]];
+        }
+
+        if (act != NULL) {
+          global_data.signal_handlers[args[0]] = handler;
+        }
+      }
+
+      ret = pthread_mutex_unlock(&global_data.signal_handlers_mutex);
+      assert(ret == 0);
+
+      args[0] = syscall_ret;
+
+      do_syscall = 0;
       break;
-    case SYSCALL_EXIT_GROUP:
+    }
+    case __NR_exit_group:
       dbm_exit(thread_data, args[0]);
       break;
-    case SYSCALL_CLOSE:
+    case __NR_close:
       if (args[0] <= 2) { // stdin, stdout, stderr
         args[0] = 0;
-        return 0;
+        do_syscall = 0;
       }
-      break;
-    case __ARM_NR_cacheflush:
-      /* Returning to the calling BB is potentially unsafe because the remaining
-         contents of the BB or other basic blocks it is linked against could be stale */
-      flush_code_cache(thread_data);
-      break;
-    case __ARM_NR_set_tls:
-      debug("set tls to %x\n", args[0]);
-      thread_data->tls = args[0];
-      args[0] = 0;
-      return 0;
       break;
     case __NR_readlinkat: {
       const int proc_buflen = 100;
@@ -215,80 +292,162 @@ int syscall_handler_pre(uint32_t syscall_no, uint32_t *args, uint16_t *next_inst
 
         strncpy((char *)args[2], path, args[3]);
         args[0] = min(path_len, args[3]);
-        return 0;
+        do_syscall = 0;
       }
       break;
     }
     /* Remove the execute permission from application mappings. At this point, this mostly acts
        as a safeguard in case a translation bug causes a branch to unmodified application code.
        Page permissions happen to be passed in the third argument both for mmap and mprotect. */
-    case __NR_mmap2:
-    case __NR_mprotect:
+#ifdef __arm__
+    case __NR_mmap2: {
+#endif
+#ifdef __aarch64__
+    case __NR_mmap: {
+#endif
+      uintptr_t syscall_ret, prot = args[2];
+
       /* Ensure that code pages are readable by the code scanner. */
       if (args[2] & PROT_EXEC) {
         assert(args[2] & PROT_READ);
+        args[2] &= ~PROT_EXEC;
       }
-      args[2] &= ~PROT_EXEC;
-      break;
+      syscall_ret = raw_syscall(syscall_no, args[0], args[1], args[2], args[3], args[4], args[5]);
+      if ((syscall_ret <= -ERANGE) && (prot & PROT_EXEC)) {
+        uintptr_t start = align_lower(syscall_ret, PAGE_SIZE);
+        uintptr_t end = align_higher(syscall_ret + args[1], PAGE_SIZE);
+        int ret = interval_map_add(&global_data.exec_allocs, start, end);
+        assert(ret == 0);
+      }
 
-    case __NR_munmap:
+      args[0] = syscall_ret;
+      do_syscall = 0;
+      break;
+    }
+    case __NR_mprotect: {
+      int ret;
+      uintptr_t syscall_ret, prot = args[2];
+
+      if (args[2] & PROT_EXEC) {
+        assert(args[2] & PROT_READ);
+        args[2] &= ~PROT_EXEC;
+      }
+      syscall_ret = raw_syscall(syscall_no, args[0], args[1], args[2]);
+      if (syscall_ret == 0) {
+        if (prot & PROT_EXEC) {
+          uintptr_t start = align_lower(args[0], PAGE_SIZE);
+          uintptr_t end = align_higher(args[0] + args[1], PAGE_SIZE);
+          ret = interval_map_add(&global_data.exec_allocs, start, end);
+          assert(ret == 0);
+        }
+      } // if syscall_ret == 0
+
+      args[0] = syscall_ret;
+      do_syscall = 0;
+      break;
+    }
+    case __NR_munmap: {
+      uintptr_t syscall_ret = raw_syscall(syscall_no, args[0], args[1]);
+
+      if (syscall_ret == 0) {
+        uintptr_t start = align_lower(args[0], PAGE_SIZE);
+        uintptr_t end = align_higher(args[0] + args[1], PAGE_SIZE);
+        ssize_t ret = interval_map_delete(&global_data.exec_allocs, start, end);
+        assert(ret >= 0);
+        if (ret >= 1) {
+          flush_code_cache(thread_data);
+        }
+      }
+
+      args[0] = syscall_ret;
+      do_syscall = 0;
+      break;
+    }
+
+#ifdef __arm__
+    case __NR_sigreturn:
+#endif
+    case __NR_rt_sigreturn: {
+      void *app_sp = args;
+#ifdef __arm__
+      /* We force all signal handler to the SA_SIGINFO type, which must return
+         with rt_sigreturn() and not sigreturn(). Some applications don't return
+         to the rt_sigreturn wrapper set by the kernel in the LR, so we need to
+         override it here. See linux/arm/kernel/signal.c for the difference
+         between the two types of signal handlers.
+      */
+      args[7] = __NR_rt_sigreturn;
+      app_sp += 64;
+#elif __aarch64__
+      app_sp += 64 + 144;
+#endif
+      ucontext_t *cont = (ucontext_t *)(app_sp + sizeof(siginfo_t));
+      sigret_dispatcher_call(thread_data, cont, cont->context_pc);
+
+      // Don't mark the thread as executing a syscall
+      return 1;
+    }
+
+#ifdef __arm__
+    case __NR_vfork:
+      // vfork without sharing the address space
+      args[0] = raw_syscall(__NR_clone, CLONE_VFORK, NULL, NULL, NULL, NULL);
+      if (args[0] == 0) {
+        reset_process(thread_data);
+      }
+      do_syscall = 0;
+      break;
+    case __ARM_NR_cacheflush:
+      fprintf(stderr, "cache flush\n");
+      /* Returning to the calling BB is potentially unsafe because the remaining
+         contents of the BB or other basic blocks it is linked against could be stale */
       flush_code_cache(thread_data);
       break;
-
-    case __NR_vfork:
-      assert(thread_data->is_vfork_child == false);
-      thread_data->is_vfork_child = true;
-      for (int i = 0; i < 3; i++) {
-        thread_data->parent_scratch_regs[i] = thread_data->scratch_regs[i];
-      }
+    case __ARM_NR_set_tls:
+      debug("set tls to %x\n", args[0]);
+      thread_data->tls = args[0];
+      args[0] = 0;
+      do_syscall = 0;
       break;
+#endif
   }
-  
-  return 1;
+
+#ifdef PLUGINS_NEW
+  if (do_syscall == 0 && global_data.free_plugin > 0) {
+    set_mambo_context(&ctx, thread_data, -1, -1, -1, -1, -1, NULL, NULL, (unsigned long *)args);
+    for (int i = 0; i < global_data.free_plugin; i++) {
+      if (global_data.plugins[i].cbs[POST_SYSCALL_C] != NULL) {
+        ctx.plugin_id = i;
+        global_data.plugins[i].cbs[POST_SYSCALL_C](&ctx);
+      } // if
+    } // for
+  }
+#endif
+
+  thread_data->status = THREAD_SYSCALL;
+
+  return do_syscall;
 }
 
-uint32_t syscall_handler_post(uint32_t syscall_no, uint32_t *args, uint16_t *next_inst, dbm_thread *thread_data) {
+void syscall_handler_post(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_inst, dbm_thread *thread_data) {
   dbm_thread *new_thread_data;
-  uint32_t addr = 0;
   
   debug("syscall post %d\n", syscall_no);
 
+  if (global_data.exit_group) {
+    thread_abort(thread_data);
+  }
+  thread_data->status = THREAD_RUNNING;
+
   switch(syscall_no) {
-    case SYSCALL_CLONE:
+    case __NR_clone:
       debug("r0 (tid): %d\n", args[0]);
       if (args[0] == 0) { // the child
-        if (thread_data->clone_vm) {
-          debug("target: %p\n", next_inst);
-          if (!allocate_thread_data(&new_thread_data)) {
-            fprintf(stderr, "Failed to allocate thread data\n");
-            while(1);
-          }
-          init_thread(new_thread_data);
-          addr = scan(new_thread_data, next_inst, ALLOCATE_BB);
-          new_thread_data->tls = thread_data->child_tls;
-          /* There are a few race conditions in this implementation, which should be addressed.
-             However, this code path is not used at the moment. We are using ptrace_create.
-             TODO:
-             * block the parent
-             * copy all shared state to the child's private data (sr_regs, next_inst, th->child_tls)
-               * args should be safe, they're pushed on the thread's stack
-             * unblock the parent
-          */
-          assert(0);
-        } else {
-          /* Without CLONE_VM, the child runs in a separate memory space,
-             no synchronisation is needed.*/
-          thread_data->tls = thread_data->child_tls;
-        }
-      }
-      break;
-
-    case __NR_vfork:
-      if (args[0] != 0) { // in the parent
-        for (int i = 0; i < 3; i++) {
-          thread_data->scratch_regs[i] = thread_data->parent_scratch_regs[i];
-        }
-        thread_data->is_vfork_child = false;
+        assert(!thread_data->clone_vm);
+        /* Without CLONE_VM, the child runs in a separate memory space,
+           no synchronisation is needed.*/
+        thread_data->tls = thread_data->child_tls;
+        reset_process(thread_data);
       }
       break;
   }
@@ -296,6 +455,4 @@ uint32_t syscall_handler_post(uint32_t syscall_no, uint32_t *args, uint16_t *nex
 #ifdef PLUGINS_NEW
   mambo_deliver_callbacks(POST_SYSCALL_C, thread_data, -1, -1, -1, -1, -1, NULL, NULL, (unsigned long *)args);
 #endif
-
-  return addr;
 }

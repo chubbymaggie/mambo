@@ -3,6 +3,7 @@
       https://github.com/beehive-lab/mambo
 
   Copyright 2013-2016 Cosmin Gorgovan <cosmin at linux-geek dot org>
+  Copyright 2017 The University of Manchester
 
   Licensed under the Apache License, Version 2.0 (the "License");
   you may not use this file except in compliance with the License.
@@ -23,11 +24,13 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <pthread.h>
+#include <errno.h>
 
+#include "dbm.h"
 #include "common.h"
 #include "scanner_public.h"
 
-#define DEBUG 1
 //#undef DEBUG
 #ifdef DEBUG
   #define debug(...) fprintf(stderr, __VA_ARGS__)
@@ -38,12 +41,12 @@
 /* Hash table */
 
 // Breaks linear probing, don't use
-void hash_delete(hash_table *table, uint32_t key) {
+void hash_delete(hash_table *table, uintptr_t key) {
   assert(false);
   int index = GET_INDEX(key);
   int end = index - 1;
   bool found = false;
-  uint32_t c_key;
+  uintptr_t c_key;
   
   do {
     c_key = table->entries[index].key;
@@ -59,11 +62,11 @@ void hash_delete(hash_table *table, uint32_t key) {
 /* To simplify the inline hash lookup code, we avoid looping around for linear probing.
    A few slots are overprovisioned at the end of the table and the last one is reserved
    empty to mark the end of the structure. */
-uint32_t hash_lookup(hash_table *table, uint32_t key) {
+uintptr_t hash_lookup(hash_table *table, uintptr_t key) {
   int index = GET_INDEX(key);
   bool found = false;
-  uint32_t entry = UINT_MAX;
-  uint32_t c_key;
+  uintptr_t entry = UINT_MAX;
+  uintptr_t c_key;
   
   do {
     c_key = table->entries[index].key;
@@ -78,16 +81,18 @@ uint32_t hash_lookup(hash_table *table, uint32_t key) {
   return entry;
 }
 
-bool hash_add(hash_table *table, uint32_t key, uint32_t value) {
+bool hash_add(hash_table *table, uintptr_t key, uintptr_t value) {
   int index = GET_INDEX(key);
   int prev_index;
   bool done = false;
   
   do {
     if (table->entries[index].key == 0 || table->entries[index].key == key) {
+      if (table->entries[index].key == 0) {
+        table->count++;
+      }
       table->entries[index].key = key;
       table->entries[index].value = value;
-      table->count++;
       done = true;
     } else {
       prev_index = index;
@@ -136,11 +141,173 @@ ll_entry *linked_list_alloc(ll *list) {
   return entry;
 }
 
+/* Interval map */
+/* Private interval_map functions; obtain lock before calling */
+void interval_map_print(interval_map *imap) {
+  fprintf(stderr, "imap %p:\n", imap);
+  for (ssize_t i = 0; i < imap->entry_count; i++) {
+    fprintf(stderr, "  %"PRIxPTR" - %"PRIxPTR"\n",
+            imap->entries[i].start, imap->entries[i].end);
+  }
+}
+
+int interval_map_delete_entry(interval_map *imap, ssize_t index) {
+  if (index < 0 || index >= imap->entry_count) {
+    return -1;
+  }
+
+  if (imap->entry_count >= 2) {
+    imap->entries[index] = imap->entries[imap->entry_count - 1];
+  }
+  imap->entry_count--;
+  return 0;
+}
+
+int interval_map_add_entry(interval_map *imap, uintptr_t start, uintptr_t end) {
+  if (imap->entry_count >= imap->mem_size || start >= end) {
+    return -1;
+  }
+  ssize_t index = imap->entry_count++;
+
+  imap->entries[index].start = start;
+  imap->entries[index].end = end;
+
+  return 0;
+}
+
+/* Public interval_map functions */
+int interval_map_init(interval_map *imap, ssize_t size) {
+  assert(size > 0);
+  interval_map_entry *entries = malloc(sizeof(interval_map_entry) * size);
+  if (entries == NULL) return -1;
+
+  imap->mem_size = size;
+  imap->entry_count = 0;
+  imap->entries = entries;
+  int ret = pthread_mutex_init(&imap->mutex, NULL);
+  if (ret != 0 && ret != EBUSY) {
+    return -1;
+  }
+
+  return 0;
+}
+
+int interval_map_add(interval_map *imap, uintptr_t start, uintptr_t end) {
+  int ret;
+  ssize_t overlap_ind = -1;
+
+  if (start >= end) return -1;
+
+  ret = pthread_mutex_lock(&imap->mutex);
+  if (ret != 0) return -1;
+
+  // Check for overlapping regions
+  for (ssize_t i = imap->entry_count -1; i >= 0; i--) {
+    if ((start < imap->entries[i].end) && (end > imap->entries[i].start)) {
+      if (overlap_ind == -1) {
+        overlap_ind = i;
+      } else {
+        start = min(imap->entries[i].start, start);
+        end = max(imap->entries[i].end, end);
+        ret = interval_map_delete_entry(imap, i);
+        assert(ret == 0);
+      }
+      imap->entries[overlap_ind].start = min(imap->entries[overlap_ind].start, start);
+      imap->entries[overlap_ind].end = max(imap->entries[overlap_ind].end, end);
+    }
+  }
+
+  // No overlapping region found
+  if (overlap_ind == -1) {
+    ret = interval_map_add_entry(imap, start, end);
+    assert(ret == 0);
+  }
+
+#ifdef DEBUG
+  fprintf(stderr, "imap added: %"PRIxPTR" %"PRIxPTR"\n", start, end);
+  interval_map_print(imap);
+#endif
+
+  ret = pthread_mutex_unlock(&imap->mutex);
+  if (ret != 0) return -1;
+
+  return 0;
+}
+
+ssize_t interval_map_search(interval_map *imap, uintptr_t start, uintptr_t end) {
+  int ret;
+  ssize_t status = 0;
+
+  if (start >= end) return -1;
+
+  ret = pthread_mutex_lock(&imap->mutex);
+  if (ret != 0) return -1;
+
+  for (ssize_t i = imap->entry_count - 1; i >= 0; i--) {
+    if ((start < imap->entries[i].end) && (end > imap->entries[i].start)) {
+      status++;
+    }
+  }
+
+  ret = pthread_mutex_unlock(&imap->mutex);
+  if (ret != 0) return -1;
+
+  return status;
+}
+
+ssize_t interval_map_delete(interval_map *imap, uintptr_t start, uintptr_t end) {
+  ssize_t status = 0;
+
+  if (start >= end) return -1;
+
+  int ret = pthread_mutex_lock(&imap->mutex);
+  if (ret != 0) return -1;
+
+  for (ssize_t i = imap->entry_count - 1; i >= 0; i--) {
+    if ((start < imap->entries[i].end) && (end > imap->entries[i].start)) {
+      status++;
+
+      if (start <= imap->entries[i].start && end >= imap->entries[i].end) {
+        ret = interval_map_delete_entry(imap, i);
+        assert(ret == 0);
+      } else if (start == imap->entries[i].start && end < imap->entries[i].end) {
+        imap->entries[i].start = end;
+      } else if (end == imap->entries[i].end && start > imap->entries[i].start) {
+        imap->entries[i].end = start;
+      } else {
+        uintptr_t tmp = imap->entries[i].end;
+        imap->entries[i].end = start;
+        ret = interval_map_add_entry(imap, end, tmp);
+        assert(ret == 0);
+      }
+    } // if hit
+  } // for
+
+#ifdef DEBUG
+  if (status > 0) {
+    fprintf(stderr, "imap deleted: %"PRIxPTR" %"PRIxPTR"\n", start, end);
+    interval_map_print(imap);
+  }
+#endif
+
+  ret = pthread_mutex_unlock(&imap->mutex);
+  if (ret != 0) return -1;
+
+  return status;
+}
 
 /* Other useful functions*/
+#ifdef __arm__
+  #define first_reg r0
+  #define last_reg pc
+#endif
+#ifdef __aarch64__
+  #define first_reg x0
+  #define last_reg sp
+#endif
 
 uint32_t next_reg_in_list(uint32_t reglist, uint32_t start) {
-  for (; start <= pc; start++) {
+  for (; start <= last_reg; start++) {
     if (reglist & (1 << start)) {
       return start;
      }
@@ -150,7 +317,7 @@ uint32_t next_reg_in_list(uint32_t reglist, uint32_t start) {
 }
 
 uint32_t last_reg_in_list(uint32_t reglist, uint32_t start) {
-  for (; start >= r0; start--) {
+  for (; start >= first_reg; start--) {
     if (reglist & (1 << start)) {
       return start;
      }
@@ -159,12 +326,27 @@ uint32_t last_reg_in_list(uint32_t reglist, uint32_t start) {
    return reg_invalid;
 }
 
-int get_n_regs(uint32_t reglist, uint32_t *regs, int n) {
+int get_lowest_n_regs(uint32_t reglist, uint32_t *regs, int n) {
   int count = 0, prev = -1;
   if (n < 1) return count;
 
   for (int i = 0; i < n; i++) {
     regs[i] = next_reg_in_list(reglist, prev + 1);
+    if (regs[i] < reg_invalid) {
+      count++;
+    }
+    prev = regs[i];
+  }
+
+  return count;
+}
+
+int get_highest_n_regs(uint32_t reglist, uint32_t *regs, int n) {
+  int count = 0, prev = reg_invalid;
+  if (n < 1) return count;
+
+  for (int i = 0; i < n; i++) {
+    regs[i] = last_reg_in_list(reglist, prev - 1);
     if (regs[i] < reg_invalid) {
       count++;
     }

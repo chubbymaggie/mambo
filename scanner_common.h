@@ -22,12 +22,18 @@
 
 #include "scanner_public.h"
 
-struct branch_context {
-  uint32_t r0;
-  uint32_t r1;
-  uint32_t r2;
-};
+#define SETUP (1 << 0)
+#define REPLACE_TARGET (1 << 1)
+#define INSERT_BRANCH (1 << 2)
+#define LATE_APP_SP (1 << 3)
 
+#ifdef __arm__
+  #define APP_SP (r3)
+  #define DISP_SP_OFFSET (28)
+  #define DISP_RES_WORDS (3)
+#endif
+
+#ifdef __arm__
 void thumb_cc_branch(dbm_thread *thread_data, uint16_t *write_p, uint32_t dest_addr);
 void thumb_b16_cond_helper(uint16_t *write_p, uint32_t dest_addr, mambo_cond cond);
 void thumb_b32_helper(uint16_t *write_p, uint32_t dest_addr);
@@ -56,6 +62,23 @@ void thumb_encode_cbz_branch(dbm_thread *thread_data,
 void arm_cc_branch(dbm_thread *thread_data, uint32_t *write_p, uint32_t target, uint32_t cond);
 void arm_b32_helper(uint32_t *write_p, uint32_t target, uint32_t cond);
 void arm_adjust_b_bl_target(uint32_t *write_p, uint32_t dest_addr);
+void branch_save_context(dbm_thread *thread_data, uint16_t **o_write_p, bool late_app_sp);
+#endif
+
+#ifdef __aarch64__
+void a64_branch_helper(uint32_t *write_p, uint64_t target, bool link);
+void a64_b_helper(uint32_t *write_p, uint64_t target);
+void a64_bl_helper(uint32_t *write_p, uint64_t target);
+void a64_b_cond_helper(uint32_t *write_p, uint64_t target, mambo_cond cond);
+void a64_cbz_cbnz_helper(uint32_t *write_p, bool cbnz, uint64_t target, uint32_t sf, uint32_t rt);
+void a64_cbz_helper(uint32_t *write_p, uint64_t target, uint32_t sf, uint32_t rt);
+void a64_cbnz_helper(uint32_t *write_p, uint64_t target, uint32_t sf, uint32_t rt);
+void a64_tbz_tbnz_helper(uint32_t *write_p, bool is_tbnz,
+                         uint64_t target, enum reg reg, uint32_t bit);
+void a64_tbz_helper(uint32_t *write_p, uint64_t target, enum reg reg, uint32_t bit);
+void a64_tbnz_helper(uint32_t *write_p, uint64_t target, enum reg reg, uint32_t bit);
+void a64_cc_branch(dbm_thread *thread_data, uint32_t *write_p, uint64_t target);
+#endif
 
 extern void inline_hash_lookup();
 extern void end_of_inline_hash_lookup();

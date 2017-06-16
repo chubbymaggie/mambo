@@ -35,6 +35,9 @@ typedef struct {
   void *write_p;
   unsigned long *regs;
   bool replace;
+  uint32_t pushed_regs;
+  uint32_t available_regs;
+  int plugin_pushed_reg_count;
 } mambo_context;
 
 typedef int (*mambo_callback)(mambo_context *ctx);
@@ -42,6 +45,8 @@ typedef int (*mambo_callback)(mambo_context *ctx);
 typedef enum {
   PRE_INST_C,
   POST_INST_C,
+  PRE_BB_C,
+  POST_BB_C,
   PRE_FRAGMENT_C,
   POST_FRAGMENT_C,
   PRE_SYSCALL_C,
@@ -51,6 +56,21 @@ typedef enum {
   EXIT_C,
   CALLBACK_MAX_IDX,
 } mambo_cb_idx;
+
+typedef enum {
+  BRANCH_NONE = (1 << 0),
+  BRANCH_DIRECT = (1 << 1),
+  BRANCH_INDIRECT = (1 << 2),
+  BRANCH_RETURN = (1 << 3),
+  BRANCH_COND = (1 << 4),
+  BRANCH_COND_PSR = (1 << 5),
+  BRANCH_COND_CBZ = (1 << 6),
+  BRANCH_COND_TBZ = (1 << 7), // A64-only
+  BRANCH_COND_IT = (1 << 8),  // T32-only
+  BRANCH_CALL = (1 << 9),
+  BRANCH_INTERWORKING = (1 << 10), // A32 and T32
+  BRANCH_TABLE = (1 << 11),        // T32-only
+} mambo_branch_type;
 
 typedef struct {
   mambo_callback cbs[CALLBACK_MAX_IDX];
@@ -70,6 +90,8 @@ mambo_context *mambo_register_plugin(void);
 
 int mambo_register_pre_inst_cb(mambo_context *ctx, mambo_callback cb);
 int mambo_register_post_inst_cb(mambo_context *ctx, mambo_callback cb);
+int mambo_register_pre_basic_block_cb(mambo_context *ctx, mambo_callback cb);
+int mambo_register_post_basic_block_cb(mambo_context *ctx, mambo_callback cb);
 int mambo_register_pre_fragment_cb(mambo_context *ctx, mambo_callback cb);
 int mambo_register_post_fragment_cb(mambo_context *ctx, mambo_callback cb);
 int mambo_register_pre_syscall_cb(mambo_context *ctx, mambo_callback cb);
@@ -88,6 +110,12 @@ void *mambo_get_plugin_data(mambo_context *ctx);
 int mambo_set_thread_plugin_data(mambo_context *ctx, void *data);
 void *mambo_get_thread_plugin_data(mambo_context *ctx);
 
+/* Scratch register management */
+int mambo_get_scratch_regs(mambo_context *ctx, int count, ...);
+int mambo_get_scratch_reg(mambo_context *ctx, int *regp);
+int mambo_free_scratch_regs(mambo_context *ctx, uint32_t regs);
+int mambo_free_scratch_reg(mambo_context *ctx, int reg);
+
 /* Other */
 int mambo_get_inst(mambo_context *ctx);
 inst_set mambo_get_inst_type(mambo_context *ctx);
@@ -102,5 +130,11 @@ bool mambo_is_cond(mambo_context *ctx);
 mambo_cond mambo_get_cond(mambo_context *ctx);
 mambo_cond mambo_get_inverted_cond(mambo_context *ctx, mambo_cond cond);
 void mambo_replace_inst(mambo_context *ctx);
+bool mambo_is_load(mambo_context *ctx);
+bool mambo_is_store(mambo_context *ctx);
+bool mambo_is_load_or_store(mambo_context *ctx);
+int mambo_get_ld_st_size(mambo_context *ctx);
+
+mambo_branch_type mambo_get_branch_type(mambo_context *ctx);
 
 #endif
